@@ -808,7 +808,7 @@ $("#fZip").onchange = (e) => {
 /* ---------- Lumen 3D depth heading (empty "no folder" screen) ----------
    Colours are read from your CSS variable --ac, so it follows the site theme. */
 const DEPTH_HERO = {
-    lines: ["Peek & organise", "any folder - By Lumin"],
+    lines: ["Peek & organise", "any folder - By Lumen"],
     layers: 30,          // extrusion slices on desktop
     mobileLayers: 20,    // fewer slices on phones = smoother
     depthEm: 0.5,        // total extrusion depth, relative to the font size
