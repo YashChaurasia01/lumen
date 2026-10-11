@@ -2262,3 +2262,270 @@ body.empty {
         animation: none !important;
     }
 }
+
+/* master (top-level) folders in the sidebar */
+.dir.master {
+    font-weight: 500;
+    background: color-mix(in srgb, var(--ac) 14%, transparent);
+    box-shadow: inset 3px 0 0 var(--ac);
+}
+
+.dir.master svg {
+    color: var(--ac);
+    fill: color-mix(in srgb, var(--ac) 40%, transparent);
+    filter: drop-shadow(0 0 5px color-mix(in srgb, var(--ac) 70%, transparent));
+}
+
+.dir.master:hover {
+    background: color-mix(in srgb, var(--ac) 26%, transparent);
+}
+
+.dir.master.on {
+    background: var(--navy);
+}
+
+.dir.master.on svg {
+    color: #fff;
+}
+/* ===== Bin · Undo / Redo ===== */
+.ib:disabled {
+    opacity: .35;
+    cursor: default;
+}
+
+.ib:disabled:hover {
+    background: transparent;
+    color: var(--tx);
+    transform: none;
+}
+
+.ib:disabled:active {
+    transform: none;
+}
+
+/* count badge on the navbar Bin button */
+.bdg {
+    position: absolute;
+    top: 1px;
+    right: 1px;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 99px;
+    background: var(--ac);
+    color: #fff;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 16px;
+    text-align: center;
+    pointer-events: none;
+    transform: scale(0);
+    transition: transform .35s cubic-bezier(.34, 1.56, .64, 1);
+}
+
+.bdg.on {
+    transform: scale(1);
+}
+
+/* Bin row pinned to the bottom of the sidebar */
+.dir.bin {
+    position: sticky;
+    bottom: 0;
+    margin-top: 10px;
+    background: var(--gl);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    box-shadow: 0 -8px 14px color-mix(in srgb, var(--panel) 70%, transparent);
+    z-index: 2;
+}
+
+.dir.bin:hover {
+    background: var(--card);
+}
+
+.dir.bin.on {
+    background: var(--navy);
+}
+
+.dir.bin.hot {
+    background: #c0392b;
+}
+
+/* Bin toolbar: only shown while the Bin is open */
+#binTools {
+    display: none;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+body.binview #binTools {
+    display: flex;
+}
+
+body.binview #bSel {
+    display: none;
+}
+
+.bt {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    border: 0;
+    border-radius: 13px;
+    padding: 7px 13px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--tx);
+    background: var(--gc);
+    cursor: pointer;
+    transition: transform .3s var(--e), background .25s, color .25s, opacity .25s;
+}
+
+.bt svg {
+    flex-shrink: 0;
+}
+
+.bt:hover:not(:disabled) {
+    transform: translateY(-2px);
+    background: var(--ac);
+    color: #fff;
+}
+
+.bt.dng:hover:not(:disabled) {
+    background: #c0392b;
+}
+
+.bt:disabled {
+    opacity: .4;
+    cursor: default;
+}
+
+.bt[hidden] {
+    display: none;
+}
+
+/* cards inside the Bin look slightly faded: they're deleted */
+body.binview .card.bn .th,
+body.binview .row.bn .th {
+    filter: saturate(.7);
+}
+
+/* empty Bin */
+.bin-empty {
+    display: grid;
+    justify-items: center;
+    gap: 6px;
+}
+
+.bin-empty svg {
+    width: 96px;
+    height: 96px;
+    color: var(--ac);
+    margin-bottom: 6px;
+}
+
+.bin-empty b {
+    color: var(--tx);
+    font-size: 19px;
+    font-weight: 600;
+}
+
+.bin-empty span {
+    max-width: 320px;
+    font-size: 14px;
+}
+
+.bin-empty .lid {
+    transform-box: fill-box;
+    transform-origin: 15% 100%;
+    animation: binlid .9s .1s cubic-bezier(.34, 1.56, .64, 1) backwards;
+}
+
+@keyframes binlid {
+    from {
+        transform: translateY(-14px) rotate(-26deg);
+        opacity: 0;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .bin-empty .lid {
+        animation: none;
+    }
+}
+/* ===== Path (breadcrumb) navigation + back / forward ===== */
+.crumb {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    overflow-x: auto;
+    text-overflow: clip;
+    scrollbar-width: none;
+}
+
+.crumb::-webkit-scrollbar {
+    display: none;
+}
+
+.crumb .sep {
+    color: var(--mut);
+    flex: none;
+    user-select: none;
+    opacity: .7;
+}
+
+.crumb .cr {
+    flex: none;
+    border: 0;
+    background: transparent;
+    color: var(--tx);
+    font: inherit;
+    font-weight: 500;
+    padding: 4px 10px;
+    border-radius: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: transform .3s cubic-bezier(.34, 1.56, .64, 1), background .25s var(--e), color .25s var(--e), box-shadow .3s var(--e);
+}
+
+.crumb .cr:hover {
+    background: var(--ac);
+    color: #fff;
+    transform: translateY(-2px) scale(1.06);
+    box-shadow: 0 6px 16px color-mix(in srgb, var(--ac) 45%, transparent);
+}
+
+.crumb .cr:active {
+    transform: scale(.9);
+    box-shadow: none;
+    transition-duration: .1s;
+}
+
+.crumb .cr.now {
+    background: var(--navy);
+    color: #d2d4d5;
+    cursor: default;
+}
+
+.crumb .cr.now:hover {
+    background: var(--navy);
+    box-shadow: none;
+    transform: none;
+}
+
+.crumb .cr:focus-visible {
+    outline: 2px solid var(--ac);
+    outline-offset: 1px;
+}
+
+#bBack:not(:disabled):hover {
+    transform: translateX(-3px);
+}
+
+#bFwd:not(:disabled):hover {
+    transform: translateX(3px);
+}

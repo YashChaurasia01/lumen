@@ -48,6 +48,9 @@ let files = [],
     idx = 0,
     src = "folder",
     showSrc = false;
+// Bin + undo/redo state
+const BIN = "#bin"; // value of `cur` while the Bin is open
+let bin = [], binId = 0, binSel = new Set(), binList = [], prevCur = "", hist = [], redoSt = [];
 const IMGX = new Set(Object.keys(MIME));
 Object.assign(MIME, {
     ttf: "font/ttf",
@@ -424,7 +427,14 @@ Object.assign(IC, {
     newfile: '<path d="M6 3h8l5 5v13H6zM12 11v6M9 14h6"/>',
     save: '<path d="M5 4h11l3 3v13H5zM8 4v5h7V4M8 20v-6h8v6"/>',
     flag: '<path d="M5 21V4m0 0h11l-2 4 2 4H5"/>',
+    master:
+        '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="m12 10.3 1.1 2.2 2.4.3-1.8 1.7.5 2.4-2.2-1.2-2.2 1.2.5-2.4-1.8-1.7 2.4-.3z"/>',
     user: '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7"/>',
+    undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>',
+    redo: '<path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/>',
+    bin: '<path d="M4 7h16M9 7l.7-3h4.6L15 7M6 7l1 13h10l1-13M10 11v6M14 11v6"/>',
+    back: '<path d="M19 12H5m5-5-5 5 5 5"/>',
+    restore: '<path d="M4 12a8 8 0 1 0 2.6-5.9L4 8.5"/><path d="M4 4v4.5h4.5M12 8v4l2.5 2"/>',
 });
 $$("[data-ic]").forEach((e) => (e.innerHTML = ic(e.dataset.ic, +e.dataset.s || 20, +e.dataset.w || 1.8)));
 TEXT.add("rtf");
@@ -472,7 +482,7 @@ const idb = async (m, k, v) => {
 const save = () => {
     clearTimeout(svt);
     svt = setTimeout(
-        () => idb("put", "s", { name: title, multi, dirs: [...dirs], files: files.map((f) => ({ path: f.path, b: f.blob })) }),
+        () => idb("put", "s", { name: title, multi, dirs: [...dirs], files: files.map((f) => ({ path: f.path, b: f.blob })), bin: serBin() }),
         400,
     );
 };
@@ -559,6 +569,11 @@ async function ingest(out, ttl, o = {}) {
             dirs = new Set();
             cur = "";
             title = ttl;
+            bin = [];
+            binSel.clear();
+            hist.length = redoSt.length = 0;
+            updBin();
+            updHist();
         }
         for (const [p, b, z] of out) {
             if (z !== undefined) await unzip(b, z); // z = folder to extract this zip into
@@ -641,7 +656,7 @@ function dlg(o) {
     });
 }
 const isZip = (n) => /\.zip$/i.test(n),
-    base = () => (cur && cur !== "*" ? cur + "/" : "");
+    base = () => (cur && cur !== "*" && cur !== BIN ? cur + "/" : "");
 const topNames = () => new Set([...allDirs()].map((d) => d.split("/")[0]));
 // A single-folder workspace becomes multi-folder: its content moves under a folder named after it
 function reroot() {
@@ -649,6 +664,13 @@ function reroot() {
     files.forEach((f) => setPath(f, r + "/" + f.path));
     dirs = new Set([...dirs].map((d) => r + "/" + d));
     dirs.add(r);
+    bin.forEach((b) => {
+        b.path = r + "/" + b.path;
+        if (b.kind === "dir") {
+            b.items.forEach((x) => (x.path = r + "/" + x.path));
+            b.dirs = b.dirs.map((d) => r + "/" + d);
+        }
+    });
     cur = "";
 }
 async function addLoose(list) {
@@ -1220,15 +1242,18 @@ function tree() {
             });
     });
     dirs.forEach(up);
-    const row = (k, n, d, c, i) =>
-        `<div class="dir" data-d="${esc(k)}" style="padding-left:${10 + d * 14}px">${ic(i, 17)}<span>${esc(n)}</span><small>${c}</small></div>`;
+    const row = (k, n, d, c, i, x = "") =>
+        `<div class="dir${x}" data-d="${esc(k)}" style="padding-left:${10 + d * 14}px">${ic(i, 17)}<span>${esc(n)}</span><small>${c}</small></div>`;
     $("#tree").innerHTML =
         row("", title || "Folder", 0, m.get(""), "folder") +
         row("*", "All", 0, m.get(""), "layers") +
         [...m.keys()]
             .filter(Boolean)
             .sort((a, b) => a.localeCompare(b, 0, { numeric: true }))
-            .map((k) => row(k, k.split("/").pop(), k.split("/").length, m.get(k), "folder"))
+            .map((k) => {
+                const mst = multi && !k.includes("/"); // top-level (master) folder of a multi-folder workspace
+                return row(k, k.split("/").pop(), k.split("/").length, m.get(k), mst ? "master" : "folder", mst ? " master" : "");
+            })
             .join("");
     $$(".dir").forEach((el) => {
         const d = el.dataset.d;
@@ -1257,8 +1282,15 @@ function tree() {
     });
     hi();
 }
+// in a multi-folder workspace the title is the live number of top-level folders
+function syncTitle() {
+    if (!multi || body.classList.contains("empty")) return;
+    const n = topNames().size;
+    title = n ? n + (n === 1 ? " folder" : " folders") : "Files";
+}
 const _r = render;
 render = function (b) {
+    syncTitle();
     const c = cur,
         all = c === "*" || !!q;
     if (all) {
@@ -1577,11 +1609,13 @@ const dl = async (f) => {
 };
 const flush = (r) => {
     if (dirty && edf) {
+        const b0 = snap();
         edf.blob = new Blob([$("#ed").value]);
         edf.size = edf.blob.size;
         edf.p = null;
         dirty = 0;
         save();
+        rec("Edit " + edf.name, b0);
         toast("Saved");
         if (r) render(false);
     }
@@ -1766,28 +1800,37 @@ async function newDir() {
     done("Folder created");
     growRow(p);
 }
-const delDir = async (d) => {
+let delDir = async (d) => {
     if (
         !(await dlg({
-            t: "Delete folder",
-            m: "Delete “" + d + "” and everything inside it?",
+            t: "Move folder to bin",
+            m: "“" + d + "” and everything inside it will go to the Bin. You can restore it from there.",
             b: [
                 ["Cancel", false],
-                ["Delete", true, "dng"],
+                ["Move to bin", true, "dng"],
             ],
         }))
     )
         return;
     const inside = files.filter((f) => f.dir === d || f.dir.startsWith(d + "/")),
         tile = $$("[data-f]").find((e) => e.dataset.f === d);
-    await poof([dirEl(d), tile, ...cardsOf(inside)].filter(Boolean));
+    await flyBin([dirEl(d), tile, ...cardsOf(inside)].filter(Boolean));
+    const gone = [...dirs].filter((x) => x === d || x.startsWith(d + "/"));
+    bin.push({ id: ++binId, kind: "dir", path: d, items: inside.map((f) => ({ f, path: f.path })), dirs: gone, at: Date.now() });
     files = files.filter((f) => !(f.dir === d || f.dir.startsWith(d + "/")));
-    [...dirs].forEach((x) => {
-        if (x === d || x.startsWith(d + "/")) dirs.delete(x);
-    });
+    gone.forEach((x) => dirs.delete(x));
+    {
+        const gf = new Set(inside),
+            gd = new Set(gone);
+        scrubHist((x) => {
+            x.files = x.files.filter((r) => !gf.has(r[0]));
+            x.dirs = x.dirs.filter((p) => !gd.has(p) && !(p === d || p.startsWith(d + "/")));
+        });
+    }
     cur = "";
     $("#content").scrollTop = 0;
-    done("Folder deleted");
+    updBin();
+    done("Folder moved to the bin");
 };
 const fileMenu = (i) => {
     const f = list[i],
@@ -1820,36 +1863,7 @@ const fileMenu = (i) => {
         { t: "Read as text", i: "files", f: () => edit(i, 0) },
         { t: "Write / append", i: "pen", f: () => edit(i, 1) },
         null,
-        {
-            t: "Rename",
-            i: "pen",
-            f: async () => {
-                const n = await dlg({
-                    t: "Rename file",
-                    v: f.name,
-                    b: [
-                        ["Cancel", null],
-                        ["Rename", "ok", "pri"],
-                    ],
-                });
-                if (!n || n === f.name) return;
-                const p = await clash((f.dir ? f.dir + "/" : "") + n.replace(/\//g, "-"), f);
-                if (p === null) return;
-                const el = cardOf(f),
-                    nm = el && el.querySelector(".nm,.n");
-                if (nm && !RM)
-                    await nm.animate(
-                        [
-                            { opacity: 1, transform: "none", filter: "none" },
-                            { opacity: 0, transform: "translateY(-10px)", filter: "blur(5px)" },
-                        ],
-                        { duration: 200, easing: "ease-in", fill: "forwards" },
-                    ).finished.catch(() => {});
-                setPath(f, p);
-                fresh.set(f, "ren");
-                done("Renamed");
-            },
-        },
+        { t: "Rename", i: "pen", f: () => renameFile(f) },
         { t: "Move to", i: "go", sub: mv },
         { t: "Copy to", i: "copy", sub: destItems((d) => copyMany([f], d)) },
         {
@@ -1917,6 +1931,11 @@ document.addEventListener(
             X = e.clientX,
             Y = e.clientY,
             R = (p) => (p === "*" ? "" : p);
+        if (e.target.closest(".dir.bin,#bBin")) return menu(X, Y, binMenu());
+        if (cur === BIN && !d) {
+            const bi = e.target.closest("[data-b]");
+            return menu(X, Y, bi ? binItemMenu(bi.dataset.b) : binMenu());
+        }
         if (c) {
             const sf = list[+c.dataset.i];
             menu(X, Y, sel.has(sf) && sel.size > 1 ? selMenu() : fileMenu(+c.dataset.i));
@@ -1996,6 +2015,12 @@ $("#bReset").onclick = async () => {
     multi = false;
     sel.clear();
     upd();
+    bin = [];
+    binSel.clear();
+    hist.length = redoSt.length = 0;
+    leaveBinView();
+    updBin();
+    updHist();
     idb("delete", "s");
     body.classList.add("empty");
     body.classList.remove("rv");
@@ -2012,12 +2037,13 @@ $(".szw [data-ic=mc]").onclick = () => stp(-30);
 $(".szw [data-ic=pc]").onclick = () => stp(30);
 (async () => {
     const s = await idb("get", "s");
-    if (!s || !s.files || !s.files.length) return;
+    if (!s || !s.files || (!s.files.length && !(s.bin && s.bin.length))) return;
     title = s.name || "Folder";
     multi = !!s.multi;
     dirs = new Set(s.dirs || []);
     files = [];
     s.files.forEach((x) => add(x.path, x.b));
+    loadBin(s.bin);
     body.classList.remove("empty");
     body.classList.add("rv");
     $$(".ctl").forEach((e, i) => e.style.setProperty("--n", i));
@@ -2222,7 +2248,7 @@ bSel.onclick = () => selectAll(!allSelected());
 addEventListener(
     "keydown",
     (e) => {
-        if (body.classList.contains("empty") || ["#modal", "#dg", "#rp"].some((s) => $(s).classList.contains("on"))) return;
+        if (body.classList.contains("empty") || cur === BIN || ["#modal", "#dg", "#rp"].some((s) => $(s).classList.contains("on"))) return;
         if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a" && !/INPUT|TEXTAREA/.test(e.target.tagName)) {
             e.preventDefault();
             selectAll(true);
@@ -2294,13 +2320,17 @@ async function copyMany(fs, d) {
     done("Copied " + nFiles(k) + " to " + where(d));
 }
 async function delMany(fs) {
-    const m = fs.length === 1 ? "Delete “" + fs[0].name + "”?" : "Delete " + fs.length + " selected files?";
-    if (!(await dlg({ t: "Delete files", m, b: [["Cancel", false], ["Delete", true, "dng"]] }))) return;
-    await poof(cardsOf(fs));
-    const s = new Set(fs);
+    const m = fs.length === 1 ? "“" + fs[0].name + "” will go to the Bin. You can restore it from there." : fs.length + " files will go to the Bin. You can restore them from there.";
+    if (!(await dlg({ t: "Move to bin", m, b: [["Cancel", false], ["Move to bin", true, "dng"]] }))) return;
+    await flyBin(cardsOf(fs));
+    const s = new Set(fs),
+        at = Date.now();
     files = files.filter((f) => !s.has(f));
+    scrubHist((x) => (x.files = x.files.filter((r) => !s.has(r[0]))));
+    fs.forEach((f) => bin.push({ id: ++binId, kind: "file", f, path: f.path, at }));
     sel.clear();
-    done("Deleted " + nFiles(fs.length));
+    updBin();
+    done("Moved " + nFiles(fs.length) + " to the bin");
 }
 async function zipMany(fs) {
     await flyDl(fs);
@@ -2350,3 +2380,837 @@ sb.addEventListener("click", (e) => {
         cm.style.top = Math.max(8, r.top - cm.offsetHeight - 8) + "px"; // open above the bar
     }
 });
+/* ======================================================================
+   Bin · Undo / Redo
+   - Deleted files and folders go to the Bin (sidebar + navbar) instead of vanishing.
+   - Restore puts every item back exactly where it was deleted from.
+   - Undo / Redo (navbar, Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y) revert any operation.
+   Animations:  delete -> cards fly into the Bin · restore -> glowing arcs back to their folder
+                empty / delete forever -> cards spiral down the drain, Bin shakes
+   ====================================================================== */
+const HMAX = 60; // undo steps kept
+const nItems = (k) => k + (k === 1 ? " item" : " items");
+const dirOf = (p) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "");
+const binFiles = (b) => (b.kind === "dir" ? b.items.map((x) => x.f) : [b.f]);
+const cloneBin = (b) => ({ ...b, items: b.items && b.items.map((x) => ({ ...x })), dirs: b.dirs && [...b.dirs] });
+
+/* ---------- history: a snapshot before + after every operation ---------- */
+function snap() {
+    // the Bin is deliberately NOT part of history: deleting, restoring and deleting forever are never undone / redone
+    return { files: files.map((f) => [f, f.path, f.blob]), dirs: [...dirs], title, multi };
+}
+// when a bin operation changes which files exist, patch every saved snapshot so undo/redo never resurrects or drops them
+const scrubHist = (fn) => [...hist, ...redoSt].forEach((h) => (fn(h.b), fn(h.a)));
+const sameBin = (x, y) =>
+    x.id === y.id &&
+    x.path === y.path &&
+    (x.kind !== "dir" ||
+        (x.items.length === y.items.length &&
+            x.items.every((it, i) => it.f === y.items[i].f && it.path === y.items[i].path) &&
+            x.dirs.length === y.dirs.length &&
+            x.dirs.every((d, i) => d === y.dirs[i])));
+function sameSnap(a, b) {
+    return (
+        a.title === b.title &&
+        a.multi === b.multi &&
+        a.files.length === b.files.length &&
+        a.files.every((x, i) => x[0] === b.files[i][0] && x[1] === b.files[i][1] && x[2] === b.files[i][2]) &&
+        a.dirs.length === b.dirs.length &&
+        a.dirs.every((d, i) => d === b.dirs[i])
+    );
+}
+function pushHist(label, b, a) {
+    hist.push({ label, b, a });
+    if (hist.length > HMAX) hist.shift();
+    redoSt.length = 0;
+    updHist();
+}
+function rec(label, before) {
+    const after = snap();
+    if (!sameSnap(before, after)) pushHist(label, before, after);
+}
+let txD = 0;
+// wraps an operation so it becomes one undo step (nested operations are folded into the outer one)
+const tx = (label, fn) =>
+    async function (...a) {
+        if (txD) return fn.apply(this, a);
+        const lab = typeof label === "function" ? label(...a) : label,
+            b = snap();
+        txD++;
+        try {
+            return await fn.apply(this, a);
+        } finally {
+            txD--;
+            rec(lab, b);
+        }
+    };
+function applySnap(s) {
+    const was = new Map(files.map((f) => [f, f.path]));
+    files = s.files.map(([f, p, bl]) => {
+        if (!was.has(f)) fresh.set(f, "new");
+        else if (was.get(f) !== p) fresh.set(f, "mv");
+        if (f.path !== p) setPath(f, p);
+        if (f.blob !== bl) {
+            f.blob = bl;
+            f.size = bl.size;
+            f.p = f.hv = f.ff = null;
+        }
+        return f;
+    });
+    dirs = new Set(s.dirs);
+    title = s.title;
+    multi = s.multi;
+    if (cur && cur !== "*" && cur !== BIN && !allDirs().includes(cur)) cur = "";
+    smooth(() => render());
+    save();
+}
+function stepHist(dir) {
+    if (txD || body.classList.contains("empty")) return;
+    flush();
+    const from = dir < 0 ? hist : redoSt,
+        to = dir < 0 ? redoSt : hist,
+        h = from.pop();
+    if (!h) return;
+    to.push(h);
+    applySnap(dir < 0 ? h.b : h.a);
+    updHist();
+    toast((dir < 0 ? "Undid · " : "Redid · ") + h.label);
+    pulseEl($(dir < 0 ? "#bUndo" : "#bRedo"));
+}
+function updHist() {
+    const u = $("#bUndo"),
+        r = $("#bRedo"),
+        hu = hist[hist.length - 1],
+        hr = redoSt[redoSt.length - 1];
+    u.disabled = !hu;
+    r.disabled = !hr;
+    u.dataset.tip = hu ? "Undo · " + hu.label + " (Ctrl+Z)" : "Nothing to undo";
+    r.dataset.tip = hr ? "Redo · " + hr.label + " (Ctrl+Shift+Z)" : "Nothing to redo";
+}
+$("#bUndo").onclick = () => stepHist(-1);
+$("#bRedo").onclick = () => stepHist(1);
+addEventListener(
+    "keydown",
+    (e) => {
+        if (body.classList.contains("empty") || ["#modal", "#dg", "#rp"].some((s) => $(s).classList.contains("on"))) return;
+        if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || e.target.isContentEditable) return;
+        if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+        const k = e.key.toLowerCase();
+        if (k === "z" && !e.shiftKey) {
+            e.preventDefault();
+            stepHist(-1);
+        } else if ((k === "z" && e.shiftKey) || k === "y") {
+            e.preventDefault();
+            stepHist(1);
+        }
+    },
+    true,
+);
+
+/* ---------- saving the bin between visits ---------- */
+function serBin() {
+    return bin.map((b) =>
+        b.kind === "dir"
+            ? { k: "d", id: b.id, path: b.path, at: b.at, dirs: b.dirs, items: b.items.map((x) => ({ path: x.path, b: x.f.blob })) }
+            : { k: "f", id: b.id, path: b.path, at: b.at, b: b.f.blob },
+    );
+}
+function mkFile(path, blob) {
+    const i = path.lastIndexOf("/"),
+        name = path.slice(i + 1);
+    return {
+        path,
+        name,
+        dir: i < 0 ? "" : path.slice(0, i),
+        ext: name.includes(".") ? name.split(".").pop().toLowerCase() : "",
+        size: blob.size,
+        blob,
+        get() {
+            return this.blob;
+        },
+        p: null,
+    };
+}
+function loadBin(a) {
+    bin = (a || []).map((x) =>
+        x.k === "d"
+            ? { id: x.id, kind: "dir", path: x.path, at: x.at, dirs: x.dirs || [], items: x.items.map((y) => ({ f: mkFile(y.path, y.b), path: y.path })) }
+            : { id: x.id, kind: "file", path: x.path, at: x.at, f: mkFile(x.path, x.b) },
+    );
+    binId = bin.reduce((m, b) => Math.max(m, b.id), 0);
+}
+
+/* ---------- Bin button, badge and sidebar row ---------- */
+const binRowEl = () => $(".dir.bin");
+const binTarget = () => [binRowEl(), $("#bBin")].find((e) => e && e.getBoundingClientRect().width);
+function updBin() {
+    const n = bin.length,
+        bd = $("#bBinN");
+    bd.textContent = n > 99 ? "99+" : n;
+    bd.classList.toggle("on", n > 0);
+    $("#bBin").dataset.tip = n ? "Bin · " + nItems(n) : "Bin";
+    $$(".dir.bin small").forEach((s) => (s.textContent = n));
+    if (body.classList.contains("binview")) updBinBar();
+}
+// the Bin wobbles like a lid slammed shut (add) or pops open (restore)
+function binGulp(add = true) {
+    if (RM) return;
+    const c = add ? "#a15c88" : "#4cc38a";
+    [binRowEl(), $("#bBin")].forEach((e) => {
+        if (!e || !e.getBoundingClientRect().width) return;
+        e.animate(
+            [
+                { transform: "none", boxShadow: `0 0 0 0 ${c}cc` },
+                { transform: "scale(1.2) rotate(-9deg)", boxShadow: `0 0 0 6px ${c}55`, offset: 0.3 },
+                { transform: "scale(.94) rotate(5deg)", boxShadow: `0 0 0 12px ${c}22`, offset: 0.62 },
+                { transform: "none", boxShadow: `0 0 0 16px ${c}00` },
+            ],
+            { duration: 560, easing: "cubic-bezier(.34,1.56,.64,1)" },
+        );
+    });
+}
+const _tree = tree;
+tree = function () {
+    _tree();
+    const el = document.createElement("div");
+    el.className = "dir bin" + (cur === BIN ? " on" : "");
+    el.dataset.d = BIN;
+    el.style.paddingLeft = "10px";
+    el.innerHTML = `${ic("bin", 17)}<span>Bin</span><small>${bin.length}</small>`;
+    el.onclick = () => (cur === BIN ? closeBin() : openBin());
+    // drag files onto the Bin to delete them
+    el.ondragover = (e) => {
+        if (dragI !== null) {
+            e.preventDefault();
+            el.classList.add("hot");
+        }
+    };
+    el.ondragleave = () => el.classList.remove("hot");
+    el.ondrop = (e) => {
+        if (dragI === null) return;
+        e.preventDefault();
+        e.stopPropagation();
+        el.classList.remove("hot");
+        body.classList.remove("mvg", "over");
+        const f = list[dragI];
+        dragI = null;
+        delMany(sel.has(f) ? [...sel] : [f]);
+    };
+    $("#tree").append(el);
+};
+$("#bBin").onclick = () => (cur === BIN ? closeBin() : openBin());
+function openBin() {
+    if (body.classList.contains("empty")) return;
+    flush(1);
+    if (cur !== BIN) prevCur = cur;
+    cur = BIN;
+    sel.clear();
+    upd();
+    render(false);
+    $("#content").scrollTop = 0;
+}
+function closeBin() {
+    cur = prevCur && prevCur !== BIN ? prevCur : "";
+    render(false);
+}
+function leaveBinView() {
+    body.classList.remove("binview");
+    $("#bBin").classList.remove("on");
+    binSel.clear();
+    binIO && binIO.disconnect();
+}
+const _r3 = render;
+render = function (b) {
+    if (cur === BIN) return renderBin(b);
+    if (body.classList.contains("binview")) leaveBinView();
+    _r3(b);
+};
+
+/* ---------- Bin view ---------- */
+$("#crumb").insertAdjacentHTML(
+    "afterend",
+    `<div id="binTools"><button class="bt" id="binRes">${ic("restore", 17)}<span>Restore all</span></button><button class="bt dng" id="binDel" hidden>${ic("trash", 17)}<span>Delete forever</span></button><button class="bt dng" id="binEmpty">${ic("bin", 17)}<span>Empty bin</span></button></div>`,
+);
+const BIN_EMPTY = `<div class="empty bin-empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><g class="lid"><path d="M4 7h16M9 7l.7-3h4.6L15 7"/></g><path d="M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg><b>The bin is empty</b><span>Deleted files and folders wait here until you restore them or empty the bin.</span></div>`;
+const ago = (t) => {
+    const s = (Date.now() - t) / 1000;
+    return s < 45 ? "just now" : s < 3600 ? Math.round(s / 60) + " min ago" : s < 86400 ? Math.round(s / 3600) + " h ago" : Math.round(s / 86400) + " d ago";
+};
+const fromLbl = (b) => dirOf(b.path) || (multi ? "top level" : title || "main folder");
+const bName = (b) => (b.kind === "dir" ? b.path.split("/").pop() : b.f.name);
+const bSize = (b) => (b.kind === "dir" ? nFiles(b.items.length) : fmt(b.f.size));
+function binItems() {
+    const s = q.toLowerCase();
+    return [...bin]
+        .filter(
+            (b) =>
+                (!s || b.path.toLowerCase().includes(s)) &&
+                (type === "all" || (b.kind === "file" && (type === "svg" ? b.f.ext === "svg" : isImg(b.f)))),
+        )
+        .sort((a, b) => b.at - a.at || a.id - b.id);
+}
+let binIO;
+function binLazy() {
+    binIO && binIO.disconnect();
+    binIO = new IntersectionObserver(
+        (es) =>
+            es.forEach(async (e) => {
+                if (!e.isIntersecting) return;
+                const t = e.target;
+                binIO.unobserve(t);
+                const b = bin.find((x) => x.id === +t.dataset.bi);
+                if (!b) return;
+                t.onload = t.onerror = () => {
+                    t.classList.add("ld");
+                    b.f.ld = 1;
+                };
+                if (b.f.ld) t.style.transition = "none";
+                t.src = await show(b.f);
+            }),
+        { root: $("#content"), rootMargin: "600px" },
+    );
+    $$("#content .lz[data-bi]").forEach((i) => binIO.observe(i));
+}
+function renderBin(rebuild) {
+    if (rebuild !== false) tree();
+    const c = $("#content"),
+        was = body.classList.contains("binview"),
+        st = was ? c.scrollTop : 0,
+        first = new Map();
+    if (was) $$("#content [data-b]").forEach((el) => first.set(el.dataset.b, el.getBoundingClientRect()));
+    body.classList.add("binview");
+    $("#bBin").classList.add("on");
+    const items = binItems();
+    binList = items;
+    items.forEach((b) => b.kind === "file" && b.f.path !== b.path && setPath(b.f, b.path)); // so the preview shows where it came from
+    list = items.filter((b) => b.kind === "file").map((b) => b.f);
+    hi();
+    $("#crumb").textContent = (title || "") + " / Bin";
+    $("#count").textContent = nItems(items.length);
+    binIO && binIO.disconnect();
+    if (!items.length) {
+        c.innerHTML = bin.length ? '<div class="empty">No matching items</div>' : BIN_EMPTY;
+        return updBinBar();
+    }
+    const th = (b) => {
+        if (b.kind === "dir") return `<div class="th e">${ic("folder", view === "grid" ? 54 : 22, 1.4)}</div>`;
+        if (kind(b.f) === "img") return `<div class="th"><img class="lz" alt="" data-bi="${b.id}"></div>`;
+        return `<div class="th e"><span class="ext">${esc((b.f.ext || "file").slice(0, 5).toUpperCase())}</span></div>`;
+    };
+    let k = 0;
+    const an = (b) => (first.has(String(b.id)) ? "" : k < 48 ? `a" style="--d:${k++ * 22}ms` : ""),
+        tip = (b) => esc("Deleted from " + fromLbl(b) + " · " + ago(b.at));
+    c.innerHTML =
+        view === "grid"
+            ? `<div class="grid">${items.map((b) => `<div class="card bn ${an(b)}" data-b="${b.id}" title="${tip(b)}">${th(b)}<div class="nm">${esc(bName(b))}<small>${bSize(b)} · from ${esc(fromLbl(b))}</small></div></div>`).join("")}</div>`
+            : `<div class="list">${items.map((b) => `<div class="row bn ${an(b)}" data-b="${b.id}" title="${tip(b)}">${th(b)}<span class="n">${esc(bName(b))}</span><span class="p">from ${esc(fromLbl(b))}</span><span class="s">${bSize(b)}</span></div>`).join("")}</div>`;
+    $$("#content .card[data-b],#content .row[data-b]").forEach((el) => {
+        el.insertAdjacentHTML("afterbegin", `<span class="sc">${SCRIBBLE}</span>`);
+        el.classList.toggle("sel", binSel.has(+el.dataset.b));
+    });
+    if (st) c.scrollTop = st;
+    if (!RM && first.size)
+        $$("#content [data-b]").forEach((el) => {
+            const a = first.get(el.dataset.b);
+            if (!a) return;
+            const r = el.getBoundingClientRect(),
+                dx = a.left - r.left,
+                dy = a.top - r.top;
+            if (Math.abs(dx) + Math.abs(dy) < 1) return;
+            el.animate(
+                [
+                    { transformOrigin: "0 0", transform: `translate(${dx}px,${dy}px)` },
+                    { transformOrigin: "0 0", transform: "none" },
+                ],
+                { duration: 560, easing: "cubic-bezier(.22,1,.36,1)" },
+            );
+        });
+    binLazy();
+    updBinBar();
+}
+function updBinBar() {
+    const n = binSel.size,
+        has = bin.length > 0;
+    $("#binRes span").textContent = n ? "Restore " + n : "Restore all";
+    $("#binRes").disabled = !has;
+    $("#binDel").hidden = !n;
+    $("#binDel span").textContent = n > 1 ? "Delete " + n + " forever" : "Delete forever";
+    $("#binEmpty").disabled = !has;
+}
+function toggleBin(id) {
+    binSel.has(id) ? binSel.delete(id) : binSel.add(id);
+    const el = $(`#content [data-b="${id}"]`);
+    if (el) {
+        el.classList.toggle("sel", binSel.has(id));
+        tilt([el]);
+    }
+    updBinBar();
+}
+function previewBin(id) {
+    const b = bin.find((x) => x.id === id),
+        i = b && b.kind === "file" ? list.indexOf(b.f) : -1;
+    if (i >= 0) open(i);
+}
+const binTargets = (id) => {
+    const b = bin.find((x) => x.id === +id);
+    return b && binSel.has(b.id) && binSel.size > 1 ? bin.filter((x) => binSel.has(x.id)) : b ? [b] : [];
+};
+// same behaviour as the file list: click opens, tick box (or any click while something is ticked) selects
+$("#content").addEventListener("click", (e) => {
+    if (cur !== BIN) return;
+    const el = e.target.closest("[data-b]");
+    if (!el) return;
+    const id = +el.dataset.b,
+        b = bin.find((x) => x.id === id);
+    if (!b) return;
+    if (e.target.closest(".sc") || binSel.size || e.ctrlKey || e.metaKey || b.kind === "dir") toggleBin(id);
+    else previewBin(id);
+});
+addEventListener(
+    "keydown",
+    (e) => {
+        if (cur !== BIN || ["#modal", "#dg", "#rp"].some((s) => $(s).classList.contains("on"))) return;
+        if (/INPUT|TEXTAREA/.test(e.target.tagName)) return;
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+            e.preventDefault();
+            binList.forEach((b) => binSel.add(b.id));
+            $$("#content [data-b]").forEach((el) => el.classList.add("sel"));
+            tilt($$("#content [data-b]"));
+            updBinBar();
+        } else if (e.key === "Escape" && binSel.size) {
+            binSel.clear();
+            $$("#content .sel").forEach((el) => el.classList.remove("sel"));
+            updBinBar();
+        }
+    },
+    true,
+);
+$("#binRes").onclick = () => restoreBin(binSel.size ? bin.filter((b) => binSel.has(b.id)) : [...bin]);
+$("#binDel").onclick = () => purgeBin(bin.filter((b) => binSel.has(b.id)));
+$("#binEmpty").onclick = () => emptyBin();
+function binItemMenu(id) {
+    const ts = binTargets(id),
+        b = ts[0],
+        many = ts.length > 1;
+    if (!b) return [];
+    return [
+        { t: many ? "Restore " + ts.length + " items" : "Restore", i: "restore", f: () => restoreBin(ts) },
+        ...(b.kind === "file" && !many ? [{ t: "Open", i: "eye", f: () => previewBin(b.id) }] : []),
+        { t: binSel.has(b.id) ? "Deselect" : "Select", i: "sel", f: () => toggleBin(b.id) },
+        null,
+        { t: many ? "Delete " + ts.length + " forever" : "Delete forever", i: "trash", d: 1, f: () => purgeBin(ts) },
+    ];
+}
+function binMenu() {
+    return [
+        ...(cur === BIN ? [] : [{ t: "Open bin", i: "bin", f: openBin }]),
+        { t: "Restore all", i: "restore", f: () => restoreBin([...bin]) },
+        null,
+        { t: "Empty bin", i: "trash", d: 1, f: () => emptyBin() },
+    ];
+}
+
+/* ---------- animations ---------- */
+const bnCards = (its) => {
+    const ids = new Set(its.map((b) => b.id)),
+        cr = $("#content").getBoundingClientRect();
+    return $$("#content .card[data-b],#content .row[data-b]").filter((el) => {
+        if (!ids.has(+el.dataset.b)) return false;
+        const r = el.getBoundingClientRect();
+        return r.width && r.bottom > cr.top && r.top < cr.bottom;
+    });
+};
+// delete -> cards fly into the Bin (sidebar row, or the navbar button when the sidebar is hidden)
+function flyBin(els) {
+    const t = binTarget(),
+        tr = t ? t.getBoundingClientRect() : rectOf(innerWidth / 2, -20);
+    return flyTo(els, tr, { dur: 620 }).then(() => binGulp(true));
+}
+function ghostOf(el) {
+    const a = el.getBoundingClientRect(),
+        g = el.cloneNode(true);
+    g.classList.remove("a", "sel", "fresh-new", "fresh-ren", "fresh-mv");
+    g.classList.add("gh");
+    const sc = g.querySelector(".sc");
+    if (sc) sc.remove();
+    Object.assign(g.style, {
+        position: "fixed",
+        left: a.left + "px",
+        top: a.top + "px",
+        width: a.width + "px",
+        height: a.height + "px",
+        margin: 0,
+        zIndex: 95,
+        pointerEvents: "none",
+        transformOrigin: "center",
+    });
+    body.append(g);
+    return [g, a];
+}
+// sparkles that fly INTO a point (the opposite of burst())
+function converge(r, cols) {
+    const cx = r.left + r.width / 2,
+        cy = r.top + r.height / 2;
+    for (let k = 0; k < 9; k++) {
+        const p = document.createElement("div"),
+            ang = (k / 9) * Math.PI * 2 + Math.random() * 0.6,
+            dist = 34 + Math.random() * 34,
+            s = 3 + Math.random() * 4;
+        Object.assign(p.style, { position: "fixed", left: cx + "px", top: cy + "px", width: s + "px", height: s + "px", borderRadius: "50%", background: cols[k % cols.length], boxShadow: `0 0 8px ${cols[k % cols.length]}`, zIndex: 96, pointerEvents: "none" });
+        body.append(p);
+        p.animate(
+            [
+                { transform: `translate(calc(-50% + ${Math.cos(ang) * dist}px),calc(-50% + ${Math.sin(ang) * dist}px)) scale(.2)`, opacity: 0 },
+                { opacity: 1, offset: 0.35 },
+                { transform: "translate(-50%,-50%) scale(1)", opacity: 0 },
+            ],
+            { duration: 520 + Math.random() * 160, easing: "cubic-bezier(.4,0,.2,1)" },
+        ).onfinish = () => p.remove();
+    }
+}
+// restore -> each card lifts off with a glow, loops up in an arc and lands in the folder it came from
+function restoreFly(fl) {
+    if (RM || !fl.length) return Promise.resolve();
+    const step = Math.min(70, 700 / fl.length),
+        glow = "drop-shadow(0 0 14px #4cc38a)";
+    let shown = false;
+    return Promise.all(
+        fl.slice(0, 30).map(
+            ({ el, to }, i) =>
+                new Promise((ok) => {
+                    const row = [dirEl(to), dirEl("")].find((e) => e && e.getBoundingClientRect().width);
+                    if (row) row.scrollIntoView({ block: "nearest" });
+                    const tr = row ? row.getBoundingClientRect() : rectOf(innerWidth / 2, -20),
+                        [g, a] = ghostOf(el),
+                        dx = tr.left + tr.width / 2 - (a.left + a.width / 2),
+                        dy = tr.top + tr.height / 2 - (a.top + a.height / 2),
+                        delay = i * step;
+                    el.style.opacity = ".12";
+                    if (i < 14) setTimeout(() => converge(a, ["#4cc38a", "#a15c88", "#ffffff"]), delay);
+                    g.animate(
+                        [
+                            { transform: "translate(0,0) scale(1) rotate(0deg)", opacity: 1, filter: "none" },
+                            { transform: "translate(0,-28px) scale(1.14) rotate(-3deg)", opacity: 1, filter: glow, offset: 0.2 },
+                            { transform: `translate(${dx * 0.5}px,${dy * 0.5 - 90}px) scale(.72) rotate(9deg)`, opacity: 1, filter: glow, offset: 0.6 },
+                            { transform: `translate(${dx}px,${dy}px) scale(.08) rotate(0deg)`, opacity: 0.25, filter: glow },
+                        ],
+                        { duration: 1000, delay, easing: "cubic-bezier(.3,.7,.4,1)", fill: "both" },
+                    ).onfinish = () => {
+                        g.remove();
+                        if (row) pulseEl(row, "#4cc38a");
+                        converge(tr, ["#4cc38a", "#ffffff"]);
+                        if (!shown) {
+                            shown = true;
+                            floatTxt(tr, "Restored", "#2e9e6b");
+                        }
+                        ok();
+                    };
+                }),
+        ),
+    );
+}
+// empty bin / delete forever -> cards are sucked down the drain in a spiral, then the Bin shakes
+function swirlAway(els, all) {
+    const t = binTarget(),
+        tr = t ? t.getBoundingClientRect() : rectOf(innerWidth / 2, innerHeight + 30),
+        tx0 = tr.left + tr.width / 2,
+        ty0 = tr.top + tr.height / 2,
+        finale = () => {
+            [binRowEl(), $("#bBin")].forEach((e) => {
+                if (!e || !e.getBoundingClientRect().width || RM) return;
+                e.animate(
+                    [
+                        { transform: "translateX(0) rotate(0)" },
+                        { transform: "translateX(-5px) rotate(-8deg)" },
+                        { transform: "translateX(5px) rotate(8deg)" },
+                        { transform: "translateX(-4px) rotate(-5deg)" },
+                        { transform: "translateX(3px) rotate(3deg)" },
+                        { transform: "none" },
+                    ],
+                    { duration: all ? 650 : 420, easing: "ease-in-out" },
+                );
+            });
+            if (RM) return;
+            burst(tr, ["#6b6f6e", "#8c9190", "#c0392b"]);
+            if (all) floatTxt(tr, "Emptied", "#c0392b");
+        };
+    if (RM || !els.length) {
+        finale();
+        return Promise.resolve();
+    }
+    const step = Math.min(35, 500 / els.length);
+    return Promise.all(
+        els.slice(0, 40).map(
+            (el, i) =>
+                new Promise((ok) => {
+                    const [g, a] = ghostOf(el),
+                        cx = a.left + a.width / 2,
+                        cy = a.top + a.height / 2,
+                        vx = cx - tx0,
+                        vy = cy - ty0,
+                        kf = [];
+                    el.style.opacity = "0";
+                    for (let s = 0; s <= 12; s++) {
+                        const u = s / 12,
+                            e = Math.pow(u, 1.5),
+                            r = Math.pow(1 - e, 1.25),
+                            th = e * Math.PI * 2.2;
+                        kf.push({
+                            transform: `translate(${tx0 + (vx * Math.cos(th) - vy * Math.sin(th)) * r - cx}px,${ty0 + (vx * Math.sin(th) + vy * Math.cos(th)) * r - cy}px) rotate(${(th * 180) / Math.PI}deg) scale(${1 - 0.94 * e})`,
+                            opacity: 1 - Math.pow(u, 3),
+                            filter: `grayscale(${e}) brightness(${1 - 0.5 * e}) blur(${(e * 3).toFixed(1)}px)`,
+                            offset: u,
+                        });
+                    }
+                    g.animate(kf, { duration: 950, delay: i * step, easing: "linear", fill: "both" }).onfinish = () => {
+                        g.remove();
+                        ok();
+                    };
+                }),
+        ),
+    ).then(finale);
+}
+
+/* ---------- operations ---------- */
+async function restoreBin(its) {
+    its = its.filter((b) => bin.includes(b));
+    if (!its.length) return;
+    const restored = [],
+        removed = new Set(),
+        flights = [];
+    for (const b of its) {
+        const rows = b.kind === "dir" ? b.items : [{ f: b.f, path: b.path }],
+            got = new Set();
+        for (const x of rows) {
+            const p = await clash(x.path, null); // asks Replace / Change name / Cancel if something is already there
+            if (p === null) continue;
+            setPath(x.f, p);
+            files.push(x.f);
+            fresh.set(x.f, "new");
+            restored.push(x.f);
+            got.add(x.f);
+        }
+        if (b.kind === "dir" && (got.size || !rows.length)) [b.path, ...b.dirs].forEach((d) => dirs.add(d));
+        const left = rows.filter((x) => !got.has(x.f));
+        if (!left.length) removed.add(b);
+        else if (b.kind === "dir") b.items = left; // some files were skipped: they stay in the bin
+        if (got.size || !rows.length) {
+            const el = $(`#content [data-b="${b.id}"]`),
+                f0 = rows.find((x) => got.has(x.f));
+            if (el) flights.push({ el, to: f0 ? dirOf(f0.f.path) : b.path });
+        }
+    }
+    bin = bin.filter((b) => !removed.has(b));
+    {
+        // restored items exist again: add them to saved snapshots so earlier undo steps keep them
+        const rd = new Set();
+        its.forEach((b) => b.kind === "dir" && [b.path, ...b.dirs].forEach((d) => dirs.has(d) && rd.add(d)));
+        scrubHist((x) => {
+            restored.forEach((f) => x.files.push([f, f.path, f.blob]));
+            rd.forEach((d) => x.dirs.includes(d) || x.dirs.push(d));
+        });
+    }
+    binSel.clear();
+    tree(); // folders that were gone exist again, so the cards can fly to them
+    updBin();
+    await restoreFly(flights);
+    binGulp(false);
+    const dests = new Set(restored.map((f) => f.dir)),
+        msg = restored.length
+            ? "Restored " + nFiles(restored.length) + (dests.size === 1 ? " to " + where([...dests][0]) : " to their original places")
+            : removed.size
+              ? "Restored " + removed.size + (removed.size === 1 ? " folder" : " folders")
+              : "Nothing restored";
+    done(msg);
+}
+async function purgeBin(its) {
+    its = its.filter((b) => bin.includes(b));
+    if (!its.length) return;
+    const m = (its.length === 1 ? "“" + bName(its[0]) + "” will be removed from the bin." : its.length + " items will be removed from the bin.") + " This can’t be undone.";
+    if (!(await dlg({ t: "Delete forever?", m, b: [["Cancel", false], ["Delete forever", true, "dng"]] }))) return;
+    await swirlAway(bnCards(its), false);
+    const s = new Set(its);
+    bin = bin.filter((b) => !s.has(b));
+    binSel.clear();
+    updBin();
+    done("Deleted " + nItems(its.length) + " forever");
+}
+async function emptyBin() {
+    if (!bin.length) return toast("The bin is already empty");
+    const n = bin.reduce((k, b) => k + binFiles(b).length, 0);
+    if (!(await dlg({ t: "Empty the bin?", m: "All " + nFiles(n) + " in the bin will be removed forever. This can’t be undone.", b: [["Cancel", false], ["Empty bin", true, "dng"]] }))) return;
+    await swirlAway(bnCards(bin), true);
+    bin = [];
+    binSel.clear();
+    updBin();
+    done("Bin emptied");
+}
+async function renameFile(f) {
+    const n = await dlg({
+        t: "Rename file",
+        v: f.name,
+        b: [
+            ["Cancel", null],
+            ["Rename", "ok", "pri"],
+        ],
+    });
+    if (!n || n === f.name) return;
+    const p = await clash((f.dir ? f.dir + "/" : "") + n.replace(/\//g, "-"), f);
+    if (p === null) return;
+    const el = cardOf(f),
+        nm = el && el.querySelector(".nm,.n");
+    if (nm && !RM)
+        await nm
+            .animate(
+                [
+                    { opacity: 1, transform: "none", filter: "none" },
+                    { opacity: 0, transform: "translateY(-10px)", filter: "blur(5px)" },
+                ],
+                { duration: 200, easing: "ease-in", fill: "forwards" },
+            )
+            .finished.catch(() => {});
+    setPath(f, p);
+    fresh.set(f, "ren");
+    done("Renamed");
+}
+
+/* ---------- every operation becomes one undo step ---------- */
+moveMany = tx((fs) => "Move " + nFiles(fs.length), moveMany);
+copyMany = tx((fs) => "Copy " + nFiles(fs.length), copyMany);
+// delete, folder delete, restore, delete forever and empty bin are intentionally NOT undo steps
+renameFile = tx((f) => "Rename " + f.name, renameFile);
+newFile = tx("New file", newFile);
+newDir = tx("New folder", newDir);
+addLoose = tx("Add files", addLoose);
+{
+    const _ingest = ingest,
+        _ingestTx = tx((o) => "Extract zip", _ingest);
+    ingest = (out, ttl, o = {}) => (o.merge ? _ingestTx(out, ttl, o) : _ingest(out, ttl, o));
+    const _start = start,
+        _startTx = tx("Add items", _start);
+    // opening the first folder is not an undo step; adding more to an open workspace is
+    start = (out, ...r) => (body.classList.contains("empty") ? _start(out, ...r) : _startTx(out, ...r));
+}
+updHist();
+updBin();
+
+/* ======================================================================
+   Navigation: Back / Forward + clickable path (breadcrumb)
+   ====================================================================== */
+let navH = [""], navI = 0, navLast = "", navBusy = false;
+const navOk = (d) => d === "" || d === "*" || d === BIN || allDirs().includes(d);
+const navFind = (dir) => {
+    for (let i = navI + dir; i >= 0 && i < navH.length; i += dir) if (navOk(navH[i])) return i;
+    return -1;
+};
+function navReset() {
+    navH = [""];
+    navI = 0;
+    navLast = "";
+}
+function navUpd() {
+    $("#bBack").disabled = navFind(-1) < 0;
+    $("#bFwd").disabled = navFind(1) < 0;
+}
+function navGo(dir) {
+    if (body.classList.contains("empty")) return;
+    const i = navFind(dir);
+    if (i < 0) return;
+    flush(1);
+    navI = i;
+    const t = navH[i];
+    if (t === BIN) {
+        if (cur !== BIN) prevCur = cur;
+        sel.clear();
+        upd();
+    }
+    navBusy = true;
+    cur = t;
+    try {
+        render(false);
+    } finally {
+        navBusy = false;
+    }
+    const c = $("#content");
+    c.scrollTop = 0;
+}
+function navCrumb() {
+    const el = $("#crumb"),
+        segs = [{ t: title || "Folder", p: "" }];
+    if (cur === "*") segs.push({ t: "All", p: "*" });
+    else if (cur === BIN) segs.push({ t: "Bin", p: BIN });
+    else if (cur) {
+        let acc = "";
+        cur.split("/").forEach((x) => {
+            acc = acc ? acc + "/" + x : x;
+            segs.push({ t: x, p: acc });
+        });
+    }
+    el.innerHTML = segs
+        .map(
+            (s, i) =>
+                (i ? '<span class="sep">/</span>' : "") +
+                `<button type="button" class="cr${i === segs.length - 1 ? " now" : ""}" data-p="${esc(s.p)}" title="${esc(s.p || "Top level")}">${esc(s.t)}</button>`,
+        )
+        .join("");
+    el.scrollLeft = el.scrollWidth;
+}
+{
+    const _rNav = render;
+    render = function (b) {
+        _rNav(b);
+        if (body.classList.contains("empty")) return;
+        if (cur !== navLast) {
+            if (!navBusy) {
+                navH = navH.slice(0, navI + 1);
+                navH.push(cur);
+                if (navH.length > 100) navH.shift();
+                navI = navH.length - 1;
+            }
+            navLast = cur;
+        }
+        navCrumb();
+        navUpd();
+    };
+    const _ingNav = ingest;
+    ingest = (out, ttl, o = {}) => {
+        if (!o.merge) navReset();
+        return _ingNav(out, ttl, o);
+    };
+}
+$("#crumb").addEventListener("click", (e) => {
+    const b = e.target.closest(".cr");
+    if (!b) return;
+    pulseEl(b);
+    const p = b.dataset.p;
+    if (p === cur) return;
+    flush(1);
+    cur = p;
+    render(false);
+    $("#content").scrollTop = 0;
+});
+$("#bBack").onclick = () => navGo(-1);
+$("#bFwd").onclick = () => navGo(1);
+const navBlocked = () => ["#modal", "#dg", "#rp"].some((s) => $(s).classList.contains("on"));
+addEventListener(
+    "keydown",
+    (e) => {
+        if (!e.altKey || e.ctrlKey || e.metaKey || navBlocked()) return;
+        if (/INPUT|TEXTAREA/.test(e.target.tagName) || e.target.isContentEditable) return;
+        if (e.key === "ArrowLeft") {
+            e.preventDefault();
+            navGo(-1);
+        } else if (e.key === "ArrowRight") {
+            e.preventDefault();
+            navGo(1);
+        }
+    },
+    true,
+);
+// mouse side buttons
+addEventListener("mouseup", (e) => {
+    if ((e.button !== 3 && e.button !== 4) || navBlocked()) return;
+    e.preventDefault();
+    navGo(e.button === 3 ? -1 : 1);
+});
+navUpd();
