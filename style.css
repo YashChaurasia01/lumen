@@ -2493,10 +2493,8 @@ body.binview .row.bn .th {
 }
 
 .crumb .cr:hover {
-    background: var(--ac);
-    color: #fff;
+    color: var(--ac);
     transform: translateY(-2px) scale(1.06);
-    box-shadow: 0 6px 16px color-mix(in srgb, var(--ac) 45%, transparent);
 }
 
 .crumb .cr:active {
