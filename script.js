@@ -262,7 +262,11 @@ function lazy() {
                 if (!f) return;
                 const k = t.dataset.k;
                 if (k === "img") {
-                    t.onload = t.onerror = () => t.classList.add("ld");
+                    t.onload = t.onerror = () => {
+                        t.classList.add("ld");
+                        f.ld = 1;
+                    };
+                    if (f.ld) t.style.transition = "none"; // already seen once: don't fade in again after a re-render
                     t.src = await show(f);
                 } else if (k === "vid") {
                     t.onloadeddata = t.onerror = () => t.classList.add("ld");
@@ -420,6 +424,7 @@ Object.assign(IC, {
     newfile: '<path d="M6 3h8l5 5v13H6zM12 11v6M9 14h6"/>',
     save: '<path d="M5 4h11l3 3v13H5zM8 4v5h7V4M8 20v-6h8v6"/>',
     flag: '<path d="M5 21V4m0 0h11l-2 4 2 4H5"/>',
+    user: '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-7 8-7s8 2.6 8 7"/>',
 });
 $$("[data-ic]").forEach((e) => (e.innerHTML = ic(e.dataset.ic, +e.dataset.s || 20, +e.dataset.w || 1.8)));
 TEXT.add("rtf");
@@ -547,6 +552,7 @@ async function unzip(b, pre) {
 async function ingest(out, ttl, o = {}) {
     showLd(ttl, "Reading…");
     P = { n: 0, t: out.length };
+    const before = o.merge ? new Set(files) : null;
     try {
         if (!o.merge) {
             files = [];
@@ -567,7 +573,10 @@ async function ingest(out, ttl, o = {}) {
     body.classList.remove("empty");
     body.classList.add("rv");
     $$(".ctl").forEach((e, i) => e.style.setProperty("--n", i));
-    render();
+    if (before) {
+        files.forEach((f) => before.has(f) || fresh.set(f, "new"));
+        smooth(() => render());
+    } else render();
     save();
     hideLd();
 }
@@ -648,6 +657,8 @@ async function addLoose(list) {
         const q = await clash(base() + p, null); // asks Replace / Change name / Cancel on a clash
         if (q === null) continue;
         add(q, b);
+        const nf = files[files.length - 1];
+        if (nf && nf.path === q) fresh.set(nf, "new");
         k++;
     }
     if (k) done("Added " + k + (k === 1 ? " file" : " files"));
@@ -1305,8 +1316,256 @@ addEventListener("dragend", () => {
     body.classList.remove("mvg");
     overOff();
 });
+/* ---------- File-operation animations ----------
+   fly   : cards fly into a sidebar folder (move / copy) or into a button (download)
+   poof  : cards crumble away with a little particle burst (delete)
+   smooth: after any change, the cards that stay glide to their new spots (FLIP)
+   fresh : files that just appeared / were renamed get a pop or glow on the next render */
+const fresh = new Map(); // file -> "new" | "ren" | "mv"
+const RM = matchMedia("(prefers-reduced-motion: reduce)").matches;
+const EASE = "cubic-bezier(.65,0,.35,1)";
+const dirEl = (d) => $$(".dir").find((e) => e.dataset.d === d);
+const rectOf = (x, y) => ({ left: x, top: y, width: 0, height: 0 });
+// visible cards / rows of the given files, in page order
+const cardsOf = (fs) => {
+    const s = new Set(fs),
+        cr = $("#content").getBoundingClientRect();
+    return $$(".card[data-i],.row[data-i]").filter((el) => {
+        if (!s.has(list[+el.dataset.i])) return false;
+        const r = el.getBoundingClientRect();
+        return r.width && r.bottom > cr.top && r.top < cr.bottom;
+    });
+};
+function pulseEl(t, c = "#a15c88") {
+    if (!t) return;
+    t.animate(
+        [
+            { transform: "scale(1.12)", boxShadow: `0 0 0 0 ${c}cc` },
+            { transform: "none", boxShadow: `0 0 0 14px ${c}00` },
+        ],
+        { duration: 420, easing: "ease-out" },
+    );
+}
+function floatTxt(r, text, bg) {
+    const e = document.createElement("div");
+    e.textContent = text;
+    Object.assign(e.style, {
+        position: "fixed",
+        left: r.left + r.width / 2 + "px",
+        top: r.top + "px",
+        padding: "2px 10px",
+        borderRadius: "99px",
+        background: bg || "var(--ac)",
+        color: "#fff",
+        fontSize: "13px",
+        fontWeight: 600,
+        zIndex: 96,
+        pointerEvents: "none",
+    });
+    body.append(e);
+    e.animate(
+        [
+            { opacity: 0, transform: "translate(-50%,0) scale(.6)" },
+            { opacity: 1, transform: "translate(-50%,-14px) scale(1)", offset: 0.25 },
+            { opacity: 0, transform: "translate(-50%,-40px) scale(1)" },
+        ],
+        { duration: 950, easing: "ease-out" },
+    ).onfinish = () => e.remove();
+}
+// ghosts of `els` travel along a curve to the target rect `tr`. keep:true leaves the originals in place (copy / download)
+function flyTo(els, tr, o = {}) {
+    if (RM) return Promise.resolve();
+    const MAX = 40,
+        step = Math.min(50, 600 / Math.max(els.length, 1)),
+        tx = tr.left + tr.width / 2,
+        ty = tr.top + tr.height / 2;
+    return Promise.all(
+        els.map(
+            (el, i) =>
+                new Promise((ok) => {
+                    if (i >= MAX) {
+                        if (!o.keep) {
+                            el.style.transition = "opacity .4s";
+                            el.style.opacity = 0;
+                        }
+                        return ok();
+                    }
+                    const a = el.getBoundingClientRect(),
+                        g = el.cloneNode(true),
+                        rot = ((i % 5) - 2) * 4,
+                        delay = i * step;
+                    g.classList.remove("a", "sel", "fresh-new", "fresh-ren", "fresh-mv");
+                    g.classList.add("gh");
+                    const sc = g.querySelector(".sc");
+                    if (sc) sc.remove();
+                    Object.assign(g.style, {
+                        position: "fixed",
+                        left: a.left + "px",
+                        top: a.top + "px",
+                        width: a.width + "px",
+                        height: a.height + "px",
+                        margin: 0,
+                        zIndex: 95,
+                        pointerEvents: "none",
+                        transformOrigin: "center",
+                    });
+                    body.append(g);
+                    if (o.keep) el.animate([{ filter: "brightness(1.6)" }, { filter: "none" }], { duration: 450, delay });
+                    else el.style.opacity = ".15";
+                    const dx = tx - (a.left + a.width / 2),
+                        dy = ty - (a.top + a.height / 2);
+                    g.animate(
+                        [
+                            { transform: "translate(0,0) scale(1) rotate(0deg)", opacity: 1 },
+                            {
+                                transform: `translate(${dx * 0.35}px,${dy * 0.35 - 46}px) scale(.8) rotate(${rot}deg)`,
+                                opacity: 1,
+                                offset: 0.38,
+                            },
+                            { transform: `translate(${dx}px,${dy}px) scale(.07) rotate(${rot * 2}deg)`, opacity: 0.3 },
+                        ],
+                        { duration: o.dur || 650, delay, easing: EASE, fill: "both" },
+                    ).onfinish = () => {
+                        g.remove();
+                        if (o.hit) o.hit();
+                        ok();
+                    };
+                }),
+        ),
+    );
+}
+// move / copy: fly the files' cards into the sidebar folder `d`
+async function flyMany(fs, d, o = {}) {
+    const els = cardsOf(fs);
+    if (!els.length) return;
+    let t = dirEl(d);
+    if (t) t.scrollIntoView({ block: "nearest" });
+    let tr = t && t.getBoundingClientRect();
+    if (!tr || !tr.width) {
+        t = null; // sidebar hidden (phones): fly off the top edge instead
+        tr = rectOf(innerWidth / 2, -20);
+    }
+    await flyTo(els, tr, { ...o, hit: () => t && pulseEl(t) });
+    if (t && o.label) floatTxt(tr, o.label);
+}
+// download: fly into the Download button of the selection bar, or off the bottom edge
+async function flyDl(fs) {
+    const els = cardsOf(fs),
+        b = sb.classList.contains("on") && $('#sb [data-a="zip"]');
+    if (!els.length) return;
+    await flyTo(els, b ? b.getBoundingClientRect() : rectOf(innerWidth / 2, innerHeight + 30), {
+        keep: true,
+        hit: () => b && pulseEl(b),
+    });
+}
+function burst(r, cols) {
+    const cx = r.left + r.width / 2,
+        cy = r.top + r.height / 2 + 10;
+    for (let k = 0; k < 8; k++) {
+        const p = document.createElement("div"),
+            ang = (k / 8) * Math.PI * 2 + Math.random() * 0.5,
+            dist = 26 + Math.random() * 30,
+            s = 4 + Math.random() * 5;
+        Object.assign(p.style, {
+            position: "fixed",
+            left: cx + "px",
+            top: cy + "px",
+            width: s + "px",
+            height: s + "px",
+            borderRadius: "50%",
+            background: cols[k % cols.length],
+            zIndex: 96,
+            pointerEvents: "none",
+        });
+        body.append(p);
+        p.animate(
+            [
+                { transform: "translate(-50%,-50%) scale(1)", opacity: 1 },
+                {
+                    transform: `translate(calc(-50% + ${Math.cos(ang) * dist}px),calc(-50% + ${Math.sin(ang) * dist}px)) scale(0)`,
+                    opacity: 0,
+                },
+            ],
+            { duration: 480 + Math.random() * 200, easing: "cubic-bezier(.2,.8,.3,1)" },
+        ).onfinish = () => p.remove();
+    }
+}
+// delete: each card swells a touch, then shrinks away in a puff of particles
+function poof(els) {
+    if (RM) return Promise.resolve();
+    const MAX = 40,
+        step = Math.min(40, 500 / Math.max(els.length, 1)),
+        cols = ["#c0392b", "#e8837a", "#a15c88"];
+    return Promise.all(
+        els.map(
+            (el, i) =>
+                new Promise((ok) => {
+                    const delay = i * step;
+                    if (i >= MAX) {
+                        el.style.transition = "opacity .3s";
+                        el.style.opacity = 0;
+                        return ok();
+                    }
+                    const r = el.getBoundingClientRect(),
+                        rot = (i % 2 ? 1 : -1) * (6 + (i % 4) * 2);
+                    if (i < 24) setTimeout(() => burst(r, cols), delay + 330);
+                    el.animate(
+                        [
+                            { transform: "none", opacity: 1, filter: "none" },
+                            { transform: "scale(1.07) rotate(-2deg)", opacity: 1, filter: "none", offset: 0.22 },
+                            { transform: `translateY(26px) scale(.15) rotate(${rot}deg)`, opacity: 0, filter: "blur(6px)" },
+                        ],
+                        { duration: 520, delay, easing: "ease-in", fill: "both" },
+                    ).onfinish = ok;
+                }),
+        ),
+    );
+}
+// FLIP: run `fn` (which re-renders), then glide every card that survived from its old spot to its new one
+function smooth(fn) {
+    const c = $("#content"),
+        st = c.scrollTop,
+        first = new Map(),
+        all = () => c.querySelectorAll(".card[data-i],.row[data-i]");
+    all().forEach((el) => {
+        const f = list[+el.dataset.i];
+        if (f) first.set(f, el.getBoundingClientRect());
+    });
+    fn();
+    if (st) c.scrollTop = st;
+    if (RM) return;
+    all().forEach((el) => {
+        const a = first.get(list[+el.dataset.i]);
+        if (!a) return;
+        el.getAnimations().forEach((x) => x.animationName === "up" && x.cancel());
+        const b = el.getBoundingClientRect(),
+            dx = a.left - b.left,
+            dy = a.top - b.top;
+        if (Math.abs(dx) + Math.abs(dy) < 1) return;
+        el.animate(
+            [
+                { transformOrigin: "0 0", transform: `translate(${dx}px,${dy}px)` },
+                { transformOrigin: "0 0", transform: "none" },
+            ],
+            { duration: 560, easing: "cubic-bezier(.22,1,.36,1)" },
+        );
+    });
+}
+// a freshly created sidebar folder slides in
+function growRow(d) {
+    const t = dirEl(d);
+    if (!t || RM) return Promise.resolve();
+    t.scrollIntoView({ block: "nearest" });
+    return t.animate(
+        [
+            { opacity: 0, transform: "translateX(-26px) scale(.9)", boxShadow: "0 0 0 0 #a15c88cc" },
+            { opacity: 1, transform: "none", boxShadow: "0 0 0 14px #a15c8800" },
+        ],
+        { duration: 650, easing: "cubic-bezier(.34,1.56,.64,1)" },
+    ).finished.catch(() => {});
+}
 const done = (m) => {
-    render();
+    smooth(() => render());
     save();
     toast(m);
 };
@@ -1468,53 +1727,8 @@ async function clash(p, self) {
         q = dir + nn.replace(/\//g, "-");
     }
 }
-function fly(i, d) {
-    return new Promise((r) => {
-        const c = $('[data-i="' + i + '"]'),
-            t = $$(".dir").find((e) => e.dataset.d === d);
-        if (!c || !t) return r();
-        const a = c.getBoundingClientRect(),
-            b = t.getBoundingClientRect(),
-            g = c.cloneNode(true);
-        Object.assign(g.style, {
-            position: "fixed",
-            left: a.left + "px",
-            top: a.top + "px",
-            width: a.width + "px",
-            height: a.height + "px",
-            margin: 0,
-            zIndex: 95,
-            pointerEvents: "none",
-            transformOrigin: "center",
-        });
-        g.classList.remove("a");
-        body.append(g);
-        c.style.opacity = 0.15;
-        const dx = b.left + b.width / 2 - (a.left + a.width / 2),
-            dy = b.top + b.height / 2 - (a.top + a.height / 2);
-        g.animate(
-            [
-                { transform: "none", opacity: 1 },
-                { transform: `translate(${dx}px,${dy}px) scale(.08)`, opacity: 0.35 },
-            ],
-            { duration: 650, easing: "cubic-bezier(.65,0,.35,1)" },
-        ).onfinish = () => {
-            g.remove();
-            t.animate([{ transform: "scale(1.12)" }, { transform: "none" }], { duration: 320 });
-            r();
-        };
-    });
-}
-async function moveFile(f, i, d) {
-    const p = await clash((d ? d + "/" : "") + f.name, f);
-    if (p === null) return;
-    if (d && !allDirs().includes(d)) {
-        dirs.add(d);
-        tree();
-    }
-    await fly(i, d);
-    setPath(f, p);
-    done("Moved to " + (d || title));
+function moveFile(f, i, d) {
+    return moveMany([f], d);
 }
 async function newFile() {
     const n = await dlg({
@@ -1530,7 +1744,8 @@ async function newFile() {
     if (p === null) return;
     add(p, new Blob([]));
     const f = files[files.length - 1];
-    render();
+    if (f && f.path === p) fresh.set(f, "new");
+    smooth(() => render());
     save();
     const i = f && f.path === p ? list.indexOf(f) : -1;
     if (i >= 0) edit(i, 1);
@@ -1549,6 +1764,7 @@ async function newDir() {
     if (allDirs().includes(p)) return toast("That folder already exists");
     dirs.add(p);
     done("Folder created");
+    growRow(p);
 }
 const delDir = async (d) => {
     if (
@@ -1562,11 +1778,15 @@ const delDir = async (d) => {
         }))
     )
         return;
+    const inside = files.filter((f) => f.dir === d || f.dir.startsWith(d + "/")),
+        tile = $$("[data-f]").find((e) => e.dataset.f === d);
+    await poof([dirEl(d), tile, ...cardsOf(inside)].filter(Boolean));
     files = files.filter((f) => !(f.dir === d || f.dir.startsWith(d + "/")));
     [...dirs].forEach((x) => {
         if (x === d || x.startsWith(d + "/")) dirs.delete(x);
     });
     cur = "";
+    $("#content").scrollTop = 0;
     done("Folder deleted");
 };
 const fileMenu = (i) => {
@@ -1615,13 +1835,31 @@ const fileMenu = (i) => {
                 if (!n || n === f.name) return;
                 const p = await clash((f.dir ? f.dir + "/" : "") + n.replace(/\//g, "-"), f);
                 if (p === null) return;
+                const el = cardOf(f),
+                    nm = el && el.querySelector(".nm,.n");
+                if (nm && !RM)
+                    await nm.animate(
+                        [
+                            { opacity: 1, transform: "none", filter: "none" },
+                            { opacity: 0, transform: "translateY(-10px)", filter: "blur(5px)" },
+                        ],
+                        { duration: 200, easing: "ease-in", fill: "forwards" },
+                    ).finished.catch(() => {});
                 setPath(f, p);
+                fresh.set(f, "ren");
                 done("Renamed");
             },
         },
         { t: "Move to", i: "go", sub: mv },
         { t: "Copy to", i: "copy", sub: destItems((d) => copyMany([f], d)) },
-        { t: "Download", i: "download", f: () => dl(f) },
+        {
+            t: "Download",
+            i: "download",
+            f: async () => {
+                await flyDl([f]);
+                dl(f);
+            },
+        },
         ...(f.ext === "zip"
             ? [
                   {
@@ -1635,26 +1873,7 @@ const fileMenu = (i) => {
               ]
             : []),
         null,
-        {
-            t: "Delete",
-            i: "trash",
-            d: 1,
-            f: async () => {
-                if (
-                    await dlg({
-                        t: "Delete file",
-                        m: "Delete “" + f.name + "”?",
-                        b: [
-                            ["Cancel", false],
-                            ["Delete", true, "dng"],
-                        ],
-                    })
-                ) {
-                    files = files.filter((x) => x !== f);
-                    done("Deleted");
-                }
-            },
-        },
+        { t: "Delete", i: "trash", d: 1, f: () => delMany([f]) },
     ];
 };
 const dirMenu = (d) => [
@@ -1962,6 +2181,25 @@ render = function (b) {
         el.insertAdjacentHTML("afterbegin", `<span class="sc">${SCRIBBLE}</span>`);
         el.classList.toggle("sel", sel.has(list[+el.dataset.i]));
     });
+    if (fresh.size) {
+        let k = 0;
+        $$(".card[data-i],.row[data-i]").forEach((el) => {
+            const kind = fresh.get(list[+el.dataset.i]);
+            if (!kind) return;
+            el.style.setProperty("--fd", Math.min(k++ * 50, 500) + "ms");
+            el.classList.add("fresh-" + kind);
+            const nm = kind === "ren" && el.querySelector(".nm,.n");
+            if (nm && !RM)
+                nm.animate(
+                    [
+                        { opacity: 0, transform: "translateY(10px)", filter: "blur(5px)", letterSpacing: ".2em" },
+                        { opacity: 1, transform: "none", filter: "none", letterSpacing: "0" },
+                    ],
+                    { duration: 520, delay: 120, easing: "cubic-bezier(.22,1,.36,1)", fill: "backwards" },
+                );
+        });
+        fresh.clear();
+    }
     upd();
 };
 
@@ -2014,42 +2252,58 @@ const destItems = (act) => [
 ];
 const nFiles = (k) => k + (k === 1 ? " file" : " files");
 const where = (d) => d || (multi ? "top level" : title);
+async function newTarget(d) {
+    if (d && !allDirs().includes(d)) {
+        dirs.add(d);
+        tree();
+        await growRow(d);
+    }
+}
 async function moveMany(fs, d) {
-    if (d && !allDirs().includes(d)) dirs.add(d);
-    let k = 0;
+    await newTarget(d);
+    const moved = [];
     for (const f of fs) {
         const np = (d ? d + "/" : "") + f.name;
         if (np === f.path) continue;
         const p = await clash(np, f); // Replace / Change name / Cancel (Cancel skips just this file)
         if (p === null) continue;
         setPath(f, p);
-        k++;
+        fresh.set(f, "mv");
+        moved.push(f);
     }
+    await flyMany(moved, d, { label: "+" + moved.length });
     sel.clear();
-    done(k ? "Moved " + nFiles(k) + " to " + where(d) : "Nothing to move");
+    done(moved.length ? "Moved " + nFiles(moved.length) + " to " + where(d) : "Nothing to move");
 }
 async function copyMany(fs, d) {
-    if (d && !allDirs().includes(d)) dirs.add(d);
+    await newTarget(d);
+    const src = [];
     let k = 0;
     for (const f of fs) {
         const np = (d ? d + "/" : "") + f.name;
         const p = np === f.path ? uniq(np) : await clash(np, null);
         if (p === null) continue;
         add(p, f.blob);
+        const nf = files[files.length - 1];
+        if (nf && nf.path === p) fresh.set(nf, "new");
+        src.push(f);
         k++;
     }
+    await flyMany(src, d, { keep: true, label: "+" + k });
     sel.clear();
     done("Copied " + nFiles(k) + " to " + where(d));
 }
 async function delMany(fs) {
     const m = fs.length === 1 ? "Delete “" + fs[0].name + "”?" : "Delete " + fs.length + " selected files?";
     if (!(await dlg({ t: "Delete files", m, b: [["Cancel", false], ["Delete", true, "dng"]] }))) return;
+    await poof(cardsOf(fs));
     const s = new Set(fs);
     files = files.filter((f) => !s.has(f));
     sel.clear();
     done("Deleted " + nFiles(fs.length));
 }
 async function zipMany(fs) {
+    await flyDl(fs);
     if (fs.length === 1) return dl(fs[0]);
     showLd("Zipping selection", nFiles(fs.length));
     const z = new JSZip();
